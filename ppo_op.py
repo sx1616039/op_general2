@@ -15,12 +15,12 @@ class Actor(nn.Module):
     def __init__(self, num_input, num_output, unit_num=100):
         super(Actor, self).__init__()
         self.fc1 = nn.Linear(num_input, unit_num)
-        self.fc2 = nn.Linear(unit_num, unit_num)
+        # self.fc2 = nn.Linear(unit_num, unit_num)
         self.action_head = nn.Linear(unit_num, num_output)
 
     def forward(self, x, mask=None):
         x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+        # x = F.relu(self.fc2(x))
         if mask is None:
             x = self.action_head(x)
         else:
@@ -70,9 +70,9 @@ class PPO:
         self.priorities = np.zeros([self.capacity], dtype=np.float32)
         self.alpha = 0.6  # parameters for priority replay
         self.beta = 0.4
+        self.upper_bound = 3
         self.convergence_episode = 2000
-        self.beta_increment = (1 - self.beta) / self.convergence_episode
-        self.init_size = 1
+        self.beta_increment = (self.upper_bound - self.beta) / self.convergence_episode
         self.train_steps = 0
 
     def select_action(self, state, action_mask):
@@ -90,13 +90,13 @@ class PPO:
             value = self.critic_net(state)
         return value.item()
 
-    def save_params(self):
-        torch.save(self.actor_net.state_dict(), 'param/net_param/actor_net.model')
-        torch.save(self.critic_net.state_dict(), 'param/net_param/critic_net.model')
+    def save_params(self, model_name):
+        torch.save(self.actor_net.state_dict(), 'param/net_param/' + model_name + '_actor_net.model')
+        torch.save(self.critic_net.state_dict(), 'param/net_param/' + model_name + '_critic_net.model')
 
-    def load_params(self):
-        self.critic_net.load_state_dict(torch.load('param/net_param/critic_net.model'))
-        self.actor_net.load_state_dict(torch.load('param/net_param/actor_net.model'))
+    def load_params(self, model_name):
+        self.critic_net.load_state_dict(torch.load('param/net_param/' + model_name + '_critic_net.model'))
+        self.actor_net.load_state_dict(torch.load('param/net_param/' + model_name + '_actor_net.model'))
 
     def learn(self, state, action, d_r, old_prob, w=None):
         if w is not None:
@@ -130,9 +130,10 @@ class PPO:
         nn.utils.clip_grad_norm_(self.critic_net.parameters(), self.max_grad_norm)
         self.critic_net_optimizer.step()
         # calculate priorities
-        for i in range(len(advantage)):
-            if advantage[i] < 0:
-                advantage[i] = 1e-5
+        if self.train_steps > self.convergence_episode:
+            for i in range(len(advantage)):
+                if advantage[i] < 0:
+                    advantage[i] = 1e-5
         prob = abs(advantage) ** self.alpha
         return np.array(prob).flatten()
 
@@ -150,20 +151,17 @@ class PPO:
                 self.priorities[index] = self.learn(state[index], action[index], d_reward[index], old_log_prob[index])
             # priority replay
             prob1 = self.priorities / np.sum(self.priorities)
-            replay_size = self.init_size + (self.batch_size - self.init_size) * pow(
-                self.train_steps / self.convergence_episode, 2)
-            indices = np.random.choice(len(ba), min(self.batch_size, int(replay_size)), p=prob1)
-            # indices = np.random.choice(len(ba), self.batch_size, p=prob1)
-            # weights = (len(ba) * prob1[indices]) ** (- self.beta)
-            # if self.beta < 1:
-            #     self.beta += self.beta_increment
-            # weights = weights / np.max(weights)
-            # weights = np.array(weights, dtype=np.float32)
-            # self.learn(state[indices], action[indices], d_reward[indices], old_log_prob[indices], weights)
-            self.learn(state[indices], action[indices], d_reward[indices], old_log_prob[indices])
+            indices = np.random.choice(len(prob1), self.batch_size, p=prob1)
+            weights = (len(ba) * prob1[indices]) ** (- self.beta)
+            if self.beta < self.upper_bound:
+                self.beta += self.beta_increment
+            weights = weights / np.max(weights)
+            weights = np.array(weights, dtype=np.float32)
+            self.learn(state[indices], action[indices], d_reward[indices], old_log_prob[indices], weights)
 
-    def train(self):
-        # self.load_params()
+    def train(self, model_name, is_reschedule=False):
+        if is_reschedule:
+            self.load_params(model_name)
         column = ["episode", "make_span", "reward", "min make span"]
         results = pd.DataFrame(columns=column, dtype=float)
         index = 0
@@ -220,21 +218,43 @@ class PPO:
         if not os.path.exists('results'):
             os.makedirs('results')
         results.to_csv("results/" + str(self.env.case_name) + "_data.csv")
-        self.save_params()
+        if not is_reschedule:
+            self.save_params(model_name+'_'+self.case_name)
         return min(converged_value), converged, time.time()-t0
+
+    def test(self, data_set):
+        self.load_params(data_set)
+        value = []
+        t0 = time.time()
+        for m in range(10):
+            state, mask = self.env.reset()
+            while True:
+                action, _ = self.select_action(state, mask)
+                next_state, reward, done, mask = self.env.step(action)
+                state = next_state
+                if done:
+                    break
+            value.append(self.env.current_time)
+        return min(value), 10, time.time()-t0
 
 
 if __name__ == '__main__':
-    name = "2-op_9202-per"
+    name = "rescheduling-gauss-time-reused-1"
     param = [name, "converged_iterations", "total_time"]
-    path = "../data_set_sizes/"
-    simple_results = pd.DataFrame(columns=param, dtype=int)
-    for file_name in os.listdir(path):
-        print(file_name + "========================")
-        title = file_name.split('.')[0]
-        env = JobEnv(title, path)
-        scale = env.job_num * env.machine_num
-        model = PPO(env, unit_num=env.state_num, memory_size=9, batch_size=2*scale, clip_ep=0.2)
-        simple_results.loc[title] = model.train()
-    simple_results.to_csv(name + ".csv")
+    path = "../data_set_gauss_time/"
+    for c in range(2):
+        name = name + str(c)
+        simple_results = pd.DataFrame(columns=param, dtype=int)
+        for file_name in os.listdir(path):
+            print(file_name + "========================")
+            title = file_name.split('.')[0]
+            basic_model = file_name.split('_')[0]
+            env = JobEnv(title, path)
+            scale = env.job_num * env.machine_num
+            model = PPO(env, unit_num=env.state_num, memory_size=9, batch_size=2 * scale, clip_ep=0.2)
+            # simple_results.loc[title] = model.train(title)
+            simple_results.loc[title] = model.train(basic_model, is_reschedule=True)
+            # simple_results.loc[title] = model.test(basic_model)
+        simple_results.to_csv(name + ".csv")
+
 

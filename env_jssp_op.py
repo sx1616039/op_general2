@@ -1,3 +1,4 @@
+import copy
 import os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -20,11 +21,12 @@ class JobEnv:
             job = list(map(int, data))
             self.job = np.array(job).reshape(self.m_n[0], self.m_n[1] * 2)
 
+        self.state_table = None
         self.job_num = self.m_n[0]
         self.machine_num = self.m_n[1]
-        self.action_num = max_job
-        self.max_job = max_job
-        self.max_machine = max_machine
+        self.action_num = self.job_num
+        self.max_job = self.job_num
+        self.max_machine = self.machine_num
         self.current_time = 0  # current time
         self.finished_jobs = None
 
@@ -32,6 +34,21 @@ class JobEnv:
         self.job_on_machine = None
         self.current_op_of_job = None
         self.assignable_job = None
+
+        self.init_op_of_job = np.repeat(0, self.job_num)  # init operation state of job
+        self.init_finished_jobs = np.zeros(self.job_num, dtype=bool)
+        self.init_assignable_jobs = np.ones(self.job_num, dtype=bool)
+        for m in range(self.job_num):
+            for n in range(self.machine_num):
+                if self.job[m][n * 2] == -self.machine_num and self.job[m][n * 2 + 1] == 0:
+                    self.init_op_of_job[m] += 1
+                    if self.init_op_of_job[m] >= self.machine_num:
+                        self.init_finished_jobs[m] = True
+                        self.init_assignable_jobs[m] = False
+                elif self.job[m][n * 2] < 0:
+                    self.job[m][n * 2] = -self.job[m][n * 2]
+                else:
+                    break
         # state features are above 4 variables
         self.state_num = max_machine * 2 + max_job*2
         self.state = None
@@ -61,6 +78,10 @@ class JobEnv:
         self.assignable_job = np.ones(self.action_num, dtype=bool)  # whether a job is assignable
         self.finished_jobs = np.zeros(self.job_num, dtype=bool)
 
+        self.finished_jobs[0:self.job_num] = self.init_finished_jobs
+        self.current_op_of_job[0:self.job_num] = self.init_op_of_job
+        self.assignable_job[0:self.job_num] = self.init_assignable_jobs
+
         self.last_release_time = np.repeat(0, self.job_num)
         self.state = np.zeros(self.state_num, dtype=float)
         self.assignable_job[self.job_num:self.action_num] = False  #
@@ -68,6 +89,7 @@ class JobEnv:
         self.mask[self.job_num:self.action_num] = -1e8
         self.done = False
         self.no_op_cnt = 0
+        self.state_table = copy.deepcopy(self.job)
         return self._get_state(), self.mask
 
     def _get_state(self):
@@ -102,8 +124,9 @@ class JobEnv:
             if self.assignable_job[x] and self.job[x][self.current_op_of_job[x] * 2] == machine_id:
                 self.assignable_job[x] = False
                 self.mask[x] = -1e8
+                self.state_table[x][self.current_op_of_job[x] * 2] = -machine_id
         # there is no assignable jobs after assigned a job and time advance is needed
-        self.reward += process_time
+        # self.reward += process_time
         while sum(self.assignable_job) == 0 and not self.stop():
             self.reward -= self.time_advance()
             self.release_machine()
@@ -120,6 +143,10 @@ class JobEnv:
             if dist_need_to_advance > 0:
                 self.next_time_on_machine[machine] += dist_need_to_advance
                 hole_len += dist_need_to_advance
+            else:
+                job = self.job_on_machine[machine]
+                if self.current_op_of_job[job]<self.machine_num:
+                    self.state_table[job][self.current_op_of_job[job]*2+1] = -dist_need_to_advance
         return hole_len
 
     def release_machine(self):
@@ -132,6 +159,8 @@ class JobEnv:
                     if not self.finished_jobs[x] and self.job[x][self.current_op_of_job[x] * 2] == k:
                         self.assignable_job[x] = True
                         self.mask[x] = 0
+                        self.state_table[x][self.current_op_of_job[x] * 2] = k
+                self.state_table[cur_job_id][self.current_op_of_job[cur_job_id] * 2] = -self.machine_num
                 self.current_op_of_job[cur_job_id] += 1
                 if self.current_op_of_job[cur_job_id] >= self.machine_num:
                     self.finished_jobs[cur_job_id] = True
@@ -142,6 +171,7 @@ class JobEnv:
                     if self.job_on_machine[next_machine] >= 0:  # 如果下一工序的机器被占用，则作业不可分配
                         self.assignable_job[cur_job_id] = False
                         self.mask[cur_job_id] = -1e8
+                        self.state_table[cur_job_id][self.current_op_of_job[cur_job_id] * 2] = -next_machine
 
     def stop(self):
         if sum(self.current_op_of_job) < self.machine_num * self.job_num:
